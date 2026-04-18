@@ -207,6 +207,58 @@ def test_flash_attention_non_causal():
 
 
 @cuda_only
+def test_flash_attention_backward_causal():
+    from cuda_qwen3_vl.kernels import flash_attention
+    torch.manual_seed(0)
+    q = torch.randn(2, 4, 16, 32, device="cuda", dtype=torch.float32, requires_grad=True)
+    k = torch.randn(2, 4, 16, 32, device="cuda", dtype=torch.float32, requires_grad=True)
+    v = torch.randn(2, 4, 16, 32, device="cuda", dtype=torch.float32, requires_grad=True)
+    scale = 32 ** -0.5
+
+    rq = q.detach().clone().requires_grad_(True)
+    rk = k.detach().clone().requires_grad_(True)
+    rv = v.detach().clone().requires_grad_(True)
+
+    out = flash_attention(q, k, v, scale=scale, is_causal=True, num_kv_groups=1)
+    ref = F.scaled_dot_product_attention(rq, rk, rv, is_causal=True, scale=scale)
+    grad = torch.randn_like(out)
+    out.backward(grad)
+    ref.backward(grad)
+
+    torch.testing.assert_close(q.grad, rq.grad, atol=5e-3, rtol=5e-3)
+    torch.testing.assert_close(k.grad, rk.grad, atol=5e-3, rtol=5e-3)
+    torch.testing.assert_close(v.grad, rv.grad, atol=5e-3, rtol=5e-3)
+
+
+@cuda_only
+def test_flash_attention_backward_gqa():
+    from cuda_qwen3_vl.kernels import flash_attention
+    torch.manual_seed(0)
+    q = torch.randn(2, 8, 16, 32, device="cuda", dtype=torch.float32, requires_grad=True)
+    k = torch.randn(2, 2, 16, 32, device="cuda", dtype=torch.float32, requires_grad=True)
+    v = torch.randn(2, 2, 16, 32, device="cuda", dtype=torch.float32, requires_grad=True)
+    scale = 32 ** -0.5
+
+    rq = q.detach().clone().requires_grad_(True)
+    rk = k.detach().clone().requires_grad_(True)
+    rv = v.detach().clone().requires_grad_(True)
+    k_exp = rk[:, :, None].expand(2, 2, 4, 16, 32).reshape(2, 8, 16, 32)
+    v_exp = rv[:, :, None].expand(2, 2, 4, 16, 32).reshape(2, 8, 16, 32)
+
+    out = flash_attention(q, k, v, scale=scale, is_causal=True, num_kv_groups=4)
+    ref = F.scaled_dot_product_attention(rq, k_exp, v_exp, is_causal=True, scale=scale)
+    grad = torch.randn_like(out)
+    out.backward(grad)
+    ref.backward(grad)
+
+    torch.testing.assert_close(q.grad, rq.grad, atol=5e-3, rtol=5e-3)
+    # dK/dV: the GQA reference backward propagates via expand — grads are summed
+    # across the 4 replicated heads. Our kernel sums all 4 Q-heads into one KV-head.
+    torch.testing.assert_close(k.grad, rk.grad, atol=5e-3, rtol=5e-3)
+    torch.testing.assert_close(v.grad, rv.grad, atol=5e-3, rtol=5e-3)
+
+
+@cuda_only
 def test_flash_attention_gqa():
     from cuda_qwen3_vl.kernels import flash_attention
     q = torch.randn(2, 8, 16, 32, device="cuda", dtype=torch.float32)

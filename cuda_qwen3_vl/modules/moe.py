@@ -64,24 +64,22 @@ class CudaSparseMoE(nn.Module):
             top_vals = top_vals / top_vals.sum(dim=-1, keepdim=True)
         top_vals = top_vals.to(x_flat.dtype)
 
-        # Expert dispatch: for each expert, gather its tokens, batched-GEMM, scatter-add back
+        # Expert dispatch: for each expert, gather its tokens, matmul, scatter-add back.
+        # cuda_index_add is autograd-aware: when grads are enabled it clones rather than
+        # mutating, so we chain the running `final` tensor through it.
         final = torch.zeros_like(x_flat)
-        # For each expert, find which (token, slot) pairs map to it
         for e in range(self.num_experts):
-            # (BS, top_k) == e -> bool mask
             mask = top_idx == e
             if not mask.any():
                 continue
             token_idx, slot_idx = mask.nonzero(as_tuple=True)
-            x_sub = x_flat[token_idx]  # (M_e, H)
-            # gate_up: (2*I, H) -> (M_e, 2*I)
+            x_sub = x_flat[token_idx]
             gu = matmul(x_sub, self.gate_up_proj[e])
             gate_part = gu[:, :self.moe_intermediate_size]
             up_part = gu[:, self.moe_intermediate_size:]
             activated = swiglu(gate_part, up_part)
-            # down: (H, I) -> (M_e, H)
             expert_out = matmul(activated, self.down_proj[e])
             weighted = expert_out * top_vals[token_idx, slot_idx, None]
-            cuda_index_add(final, weighted.to(x_flat.dtype), token_idx)
+            final = cuda_index_add(final, weighted.to(x_flat.dtype), token_idx)
 
         return final.reshape(B, S, H), router_logits

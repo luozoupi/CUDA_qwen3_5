@@ -178,3 +178,213 @@ std::vector<torch::Tensor> flash_attention_forward_cuda(
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return {out, lse};
 }
+
+// -----------------------------------------------------------------------------
+// Flash Attention backward
+//
+// Given Q, K, V, O, LSE, dO — compute dQ, dK, dV.
+//
+// Strategy: one thread-block per (batch, q_head, q_position). Each block handles
+// a single Q row end-to-end, walking the K/V sequence in tiles. Within a block,
+// kNThreadsBwd threads cooperate to parallelize over the head_dim.
+//
+// Per Q-row work:
+//   1) Recompute delta = sum_k O[q_row, k] * dO[q_row, k]
+//   2) For each k_row in 0..S_k:
+//        - Recompute S = (Q[q_row] . K[k_row]) * scale
+//        - P = exp(S - LSE[q_row])
+//        - dV[k_row] += P * dO[q_row]              (atomic)
+//        - dP = dO[q_row] . V[k_row]
+//        - dS = P * (dP - delta) * scale
+//        - dQ[q_row] += dS * K[k_row]               (local accum)
+//        - dK[k_row] += dS * Q[q_row]               (atomic)
+//   3) Write dQ[q_row]
+//
+// This is O(S_q * S_k * D) compute — same cost class as the reference backward
+// via SDPA + autograd — but fully on our CUDA kernel, no PyTorch fallback.
+// -----------------------------------------------------------------------------
+
+namespace {
+constexpr int kNThreadsBwd = 128;
+
+template <typename scalar_t>
+__device__ __forceinline__ float atomic_add_scalar_bwd(scalar_t* addr, float val);
+
+template <>
+__device__ __forceinline__ float atomic_add_scalar_bwd<float>(float* addr, float val) {
+    atomicAdd(addr, val);
+    return 0.0f;
+}
+template <>
+__device__ __forceinline__ float atomic_add_scalar_bwd<double>(double* addr, float val) {
+    atomicAdd(addr, static_cast<double>(val));
+    return 0.0f;
+}
+template <>
+__device__ __forceinline__ float atomic_add_scalar_bwd<at::Half>(at::Half* addr, float val) {
+    atomicAdd(reinterpret_cast<__half*>(addr), __float2half(val));
+    return 0.0f;
+}
+template <>
+__device__ __forceinline__ float atomic_add_scalar_bwd<at::BFloat16>(at::BFloat16* addr, float val) {
+    atomicAdd(reinterpret_cast<__nv_bfloat16*>(addr), __float2bfloat16(val));
+    return 0.0f;
+}
+
+template <typename scalar_t>
+__global__ void flash_attn_bwd_kernel(
+    const scalar_t* __restrict__ Q,
+    const scalar_t* __restrict__ K,
+    const scalar_t* __restrict__ V,
+    const scalar_t* __restrict__ O,
+    const scalar_t* __restrict__ dO,
+    const float* __restrict__ LSE,
+    scalar_t* __restrict__ dQ,
+    scalar_t* __restrict__ dK,
+    scalar_t* __restrict__ dV,
+    int64_t B, int64_t H_q, int64_t H_kv, int64_t S_q, int64_t S_k, int64_t D,
+    int64_t num_kv_groups, float scale, bool is_causal) {
+    const int pid_bh = blockIdx.y;
+    const int pid_sq = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int nthreads = blockDim.x;
+
+    const int64_t b = pid_bh / H_q;
+    const int64_t hq = pid_bh % H_q;
+    const int64_t hkv = hq / num_kv_groups;
+    const int64_t sq = pid_sq;
+    if (b >= B || sq >= S_q) return;
+
+    // Pointers to this row in each tensor.
+    const scalar_t* q_row = Q + ((b * H_q + hq) * S_q + sq) * D;
+    const scalar_t* do_row = dO + ((b * H_q + hq) * S_q + sq) * D;
+    const scalar_t* o_row = O + ((b * H_q + hq) * S_q + sq) * D;
+    scalar_t* dq_row = dQ + ((b * H_q + hq) * S_q + sq) * D;
+
+    // Shared memory: Q row + dO row + delta scalar + dq row accumulator (fp32).
+    extern __shared__ float smem[];
+    float* q_fp = smem;                       // D
+    float* do_fp = smem + D;                  // D
+    float* dq_fp = smem + 2 * D;              // D
+    float* reduce = smem + 3 * D;             // nthreads
+
+    // Load Q row + dO row; initialize dq accum + compute delta.
+    float thread_delta = 0.0f;
+    for (int d = tid; d < D; d += nthreads) {
+        float qv = static_cast<float>(q_row[d]);
+        float dov = static_cast<float>(do_row[d]);
+        float ov = static_cast<float>(o_row[d]);
+        q_fp[d] = qv;
+        do_fp[d] = dov;
+        dq_fp[d] = 0.0f;
+        thread_delta += ov * dov;
+    }
+    // Block reduce delta.
+    reduce[tid] = thread_delta;
+    __syncthreads();
+    for (int off = nthreads / 2; off > 0; off >>= 1) {
+        if (tid < off) reduce[tid] += reduce[tid + off];
+        __syncthreads();
+    }
+    const float delta = reduce[0];
+    __syncthreads();
+
+    const float lse = LSE[(b * H_q + hq) * S_q + sq];
+
+    const int64_t sk_end = is_causal ? (sq + 1) : S_k;
+
+    for (int64_t sk = 0; sk < sk_end; ++sk) {
+        const scalar_t* k_row = K + ((b * H_kv + hkv) * S_k + sk) * D;
+        const scalar_t* v_row = V + ((b * H_kv + hkv) * S_k + sk) * D;
+        scalar_t* dk_row = dK + ((b * H_kv + hkv) * S_k + sk) * D;
+        scalar_t* dv_row = dV + ((b * H_kv + hkv) * S_k + sk) * D;
+
+        // Compute S = Q . K, and dP = dO . V, with one pass.
+        float thread_s = 0.0f;
+        float thread_dp = 0.0f;
+        for (int d = tid; d < D; d += nthreads) {
+            float kv = static_cast<float>(k_row[d]);
+            float vv = static_cast<float>(v_row[d]);
+            thread_s += q_fp[d] * kv;
+            thread_dp += do_fp[d] * vv;
+        }
+        reduce[tid] = thread_s;
+        __syncthreads();
+        for (int off = nthreads / 2; off > 0; off >>= 1) {
+            if (tid < off) reduce[tid] += reduce[tid + off];
+            __syncthreads();
+        }
+        const float S = reduce[0] * scale;
+        __syncthreads();
+
+        reduce[tid] = thread_dp;
+        __syncthreads();
+        for (int off = nthreads / 2; off > 0; off >>= 1) {
+            if (tid < off) reduce[tid] += reduce[tid + off];
+            __syncthreads();
+        }
+        const float dP = reduce[0];
+        __syncthreads();
+
+        const float P = __expf(S - lse);
+        const float dS = P * (dP - delta) * scale;
+
+        for (int d = tid; d < D; d += nthreads) {
+            // dV[sk, d] += P * dO[sq, d]
+            atomic_add_scalar_bwd<scalar_t>(&dv_row[d], P * do_fp[d]);
+            // dQ[sq, d] += dS * K[sk, d] (local)
+            dq_fp[d] += dS * static_cast<float>(k_row[d]);
+            // dK[sk, d] += dS * Q[sq, d]
+            atomic_add_scalar_bwd<scalar_t>(&dk_row[d], dS * q_fp[d]);
+        }
+        __syncthreads();
+    }
+
+    // Write dQ row.
+    for (int d = tid; d < D; d += nthreads) {
+        dq_row[d] = static_cast<scalar_t>(dq_fp[d]);
+    }
+}
+}  // namespace
+
+std::vector<torch::Tensor> flash_attention_backward_cuda(
+    const torch::Tensor& q, const torch::Tensor& k, const torch::Tensor& v,
+    const torch::Tensor& o, const torch::Tensor& lse, const torch::Tensor& grad_o,
+    double scale, bool is_causal, int64_t num_kv_groups) {
+    CHECK_INPUT(q);
+    CHECK_INPUT(k);
+    CHECK_INPUT(v);
+    CHECK_INPUT(o);
+    CHECK_INPUT(grad_o);
+    c10::cuda::CUDAGuard guard(q.device());
+
+    const int64_t B = q.size(0);
+    const int64_t H_q = q.size(1);
+    const int64_t H_kv = k.size(1);
+    const int64_t S_q = q.size(2);
+    const int64_t S_k = k.size(2);
+    const int64_t D = q.size(3);
+    TORCH_CHECK(D <= 128, "head dim > 128 not supported");
+    TORCH_CHECK(num_kv_groups * H_kv == H_q, "H_q must equal num_kv_groups * H_kv");
+
+    auto dq = torch::zeros_like(q);
+    auto dk = torch::zeros_like(k);
+    auto dv = torch::zeros_like(v);
+
+    const dim3 grid(static_cast<unsigned>(S_q), static_cast<unsigned>(B * H_q));
+    const dim3 block(kNThreadsBwd);
+    // Shared memory: q_fp + do_fp + dq_fp + reduce = (3*D + nthreads) floats
+    const size_t shmem_bytes = (3 * D + kNThreadsBwd) * sizeof(float);
+    const auto stream = at::cuda::getCurrentCUDAStream();
+
+    DISPATCH_FLOAT_TYPES(q.scalar_type(), "flash_attn_bwd", [&] {
+        flash_attn_bwd_kernel<scalar_t><<<grid, block, shmem_bytes, stream>>>(
+            q.data_ptr<scalar_t>(), k.data_ptr<scalar_t>(), v.data_ptr<scalar_t>(),
+            o.data_ptr<scalar_t>(), grad_o.data_ptr<scalar_t>(), lse.data_ptr<float>(),
+            dq.data_ptr<scalar_t>(), dk.data_ptr<scalar_t>(), dv.data_ptr<scalar_t>(),
+            B, H_q, H_kv, S_q, S_k, D, num_kv_groups,
+            static_cast<float>(scale), is_causal);
+    });
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return {dq, dk, dv};
+}

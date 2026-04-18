@@ -57,16 +57,20 @@ class CudaQwen3VLMoeModel(nn.Module):
             self.lm_head.weight = self.embed_tokens.weight
 
     def _text_forward(
-        self, input_embeds: torch.Tensor, position_ids: torch.Tensor
-    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        self, input_embeds: torch.Tensor, position_ids: torch.Tensor,
+        past_key_values: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
+    ) -> tuple[torch.Tensor, list[torch.Tensor], list[tuple[torch.Tensor, torch.Tensor]]]:
         x = input_embeds
         mrope_fn = lambda q, k: self.rotary.apply(q, k, position_ids)
         router_logits_all: list[torch.Tensor] = []
-        for layer in self.layers:
-            x, rl = layer(x, mrope_fn)
+        new_kvs: list[tuple[torch.Tensor, torch.Tensor]] = []
+        for i, layer in enumerate(self.layers):
+            layer_past = past_key_values[i] if past_key_values is not None else None
+            x, rl, new_kv = layer(x, mrope_fn, past_kv=layer_past)
             if rl is not None:
                 router_logits_all.append(rl)
-        return self.norm(x), router_logits_all
+            new_kvs.append(new_kv)
+        return self.norm(x), router_logits_all, new_kvs
 
     def forward(
         self,
@@ -75,7 +79,9 @@ class CudaQwen3VLMoeModel(nn.Module):
         vision_position_ids: torch.Tensor | None = None,
         image_token_mask: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        past_key_values: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
+        return_kv: bool = False,
+    ):
         assert input_ids is not None
         inputs_embeds = self.embed_tokens(input_ids)
         if pixel_values is not None and image_token_mask is not None:
@@ -84,7 +90,11 @@ class CudaQwen3VLMoeModel(nn.Module):
             inputs_embeds[image_token_mask] = vision_feats.to(inputs_embeds.dtype)
         if position_ids is None:
             B, S = input_ids.shape
-            pos = torch.arange(S, device=input_ids.device).unsqueeze(0).expand(B, S)
+            past_len = past_key_values[0][0].shape[2] if past_key_values else 0
+            pos = torch.arange(past_len, past_len + S, device=input_ids.device).unsqueeze(0).expand(B, S)
             position_ids = torch.stack([pos, pos, pos], dim=0)
-        hidden, router_logits = self._text_forward(inputs_embeds, position_ids)
-        return self.lm_head(hidden), router_logits
+        hidden, router_logits, new_kvs = self._text_forward(inputs_embeds, position_ids, past_key_values=past_key_values)
+        logits = self.lm_head(hidden)
+        if return_kv:
+            return logits, router_logits, new_kvs
+        return logits, router_logits
