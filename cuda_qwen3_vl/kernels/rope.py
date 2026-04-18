@@ -56,6 +56,9 @@ class _RopeFunction(torch.autograd.Function):
 
 
 def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    # Kernel requires cos/sin dtype to match x; cast before dispatch so the CUDA path is usable.
+    cos = cos.to(x.dtype)
+    sin = sin.to(x.dtype)
     if not x.is_cuda:
         return _fallback(x, cos, sin)
     if torch.is_grad_enabled() and x.requires_grad:

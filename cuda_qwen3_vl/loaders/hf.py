@@ -1,10 +1,14 @@
 """HuggingFace weight loader for CUDA Qwen3-VL models.
 
-Maps HF parameter names to our internal layout:
-- HF vision:  `visual.patch_embed.proj.weight` -> `visual.patch_embed.weight`
-- HF text:    `model.layers.N.*` -> `layers.N.*`
-- HF MoE:     `model.layers.N.mlp.experts.gate_up_proj` -> `layers.N.mlp.gate_up_proj`
-- HF gate:    `model.layers.N.mlp.gate.weight` -> `layers.N.mlp.gate_weight`
+Verified against the Qwen3-VL-8B-Instruct safetensors index. Exact HF key patterns:
+- Text: `model.language_model.{embed_tokens,layers.N.*,norm}.weight`
+- LM head: `lm_head.weight` (top-level, not under model.)
+- Vision: `model.visual.patch_embed.proj.{weight,bias}`,
+          `model.visual.pos_embed.weight`,
+          `model.visual.blocks.N.{norm1,norm2,attn.{qkv,proj},mlp.{linear_fc1,linear_fc2}}.{weight,bias}`,
+          `model.visual.merger.{norm,linear_fc1,linear_fc2}.{weight,bias}`,
+          `model.visual.deepstack_merger_list.N.{norm,linear_fc1,linear_fc2}.{weight,bias}`
+- MoE (Qwen3-VL-MoE variant): `model.language_model.layers.N.mlp.{experts.gate_up_proj,experts.down_proj,gate.weight}`
 """
 from __future__ import annotations
 
@@ -14,48 +18,38 @@ import torch
 from safetensors import safe_open
 
 
-def _strip_prefixes(name: str) -> str:
-    for p in ("language_model.", "model.language_model.", "model."):
-        if name.startswith(p):
-            return name[len(p):]
-    return name
-
-
 def _map_name(name: str) -> str | None:
     """Translate HF parameter name to our internal name. Returns None if unmapped."""
-    # Vision tower
-    if name.startswith("visual."):
-        # HF: visual.patch_embed.proj.{weight,bias} -> visual.patch_embed.{weight,bias}
-        name = name.replace("visual.patch_embed.proj.", "visual.patch_embed.")
-        # HF: visual.blocks.N.norm1.{weight,bias} etc -> visual.blocks.N.norm1.{weight,bias} (match)
-        # HF: visual.blocks.N.attn.qkv.{weight,bias} -> visual.blocks.N.attn.qkv.{weight,bias} (match)
-        # HF: visual.blocks.N.attn.proj.{weight,bias} -> visual.blocks.N.attn.proj.{weight,bias} (match)
-        # HF: visual.blocks.N.mlp.linear_fc1/fc2.{weight,bias} -> visual.blocks.N.mlp.linear_fc1/fc2.{weight,bias} (match)
-        # HF: visual.merger.ln_q.{weight,bias} -> visual.merger.norm.{weight,bias}
-        name = name.replace("visual.merger.ln_q.", "visual.merger.norm.")
-        # HF: visual.merger.mlp.0.{weight,bias} -> visual.merger.linear_fc1.{weight,bias}
-        name = name.replace("visual.merger.mlp.0.", "visual.merger.linear_fc1.")
-        name = name.replace("visual.merger.mlp.2.", "visual.merger.linear_fc2.")
-        # HF: visual.deepstack_merger_list.N.{norm,linear_fc1,linear_fc2}
-        name = name.replace("visual.deepstack_merger_list.", "visual.deepstack_mergers.")
-        # HF: visual.pos_embed.weight -> visual.pos_embed.emb.weight
-        name = name.replace("visual.pos_embed.weight", "visual.pos_embed.emb.weight")
-        return name
+    # LM head sits at top-level (not under model.)
+    if name == "lm_head.weight":
+        return "lm_head.weight"
 
-    stripped = _strip_prefixes(name)
-    # Text stack:
-    # HF: layers.N.self_attn.{q,k,v,o}_proj.weight -> layers.N.self_attn.{q,k,v,o}_proj.weight (match)
-    # HF: layers.N.self_attn.q_norm.weight -> layers.N.self_attn.q_norm.weight (match)
-    # HF: layers.N.mlp.{gate,up,down}_proj.weight -> layers.N.mlp.{gate,up,down}_proj.weight (match)
-    # HF MoE: layers.N.mlp.experts.{gate_up_proj,down_proj} -> layers.N.mlp.{gate_up_proj,down_proj}
-    stripped = stripped.replace("mlp.experts.gate_up_proj", "mlp.gate_up_proj")
-    stripped = stripped.replace("mlp.experts.down_proj", "mlp.down_proj")
-    # HF MoE: layers.N.mlp.gate.weight -> layers.N.mlp.gate_weight
-    stripped = stripped.replace("mlp.gate.weight", "mlp.gate_weight")
-    # HF: embed_tokens.weight -> embed_tokens.weight (match)
-    # HF: norm.weight -> norm.weight (match)
-    # HF: lm_head.weight -> lm_head.weight (at top level — handled by caller if needed)
-    return stripped
+    # Vision tower: prefix is `model.visual.`
+    if name.startswith("model.visual."):
+        rest = name[len("model.visual."):]  # e.g. "patch_embed.proj.weight"
+        # patch_embed.proj.{w,b} -> patch_embed.{w,b}
+        rest = rest.replace("patch_embed.proj.", "patch_embed.")
+        # pos_embed.weight -> pos_embed.emb.weight (we wrapped nn.Embedding in a module)
+        if rest == "pos_embed.weight":
+            rest = "pos_embed.emb.weight"
+        # deepstack_merger_list.N.* -> deepstack_mergers.N.*
+        rest = rest.replace("deepstack_merger_list.", "deepstack_mergers.")
+        # blocks.N.*, merger.* pass through unchanged
+        return f"visual.{rest}"
+
+    # Text stack: prefix is `model.language_model.`
+    if name.startswith("model.language_model."):
+        rest = name[len("model.language_model."):]
+        # MoE-specific renames (only present in the MoE checkpoint):
+        # layers.N.mlp.experts.gate_up_proj -> layers.N.mlp.gate_up_proj
+        rest = rest.replace("mlp.experts.gate_up_proj", "mlp.gate_up_proj")
+        rest = rest.replace("mlp.experts.down_proj", "mlp.down_proj")
+        # layers.N.mlp.gate.weight -> layers.N.mlp.gate_weight
+        rest = rest.replace("mlp.gate.weight", "mlp.gate_weight")
+        return rest
+
+    # Anything else: unmapped
+    return None
 
 
 def load_hf_weights(model: torch.nn.Module, snapshot_path: str | Path) -> dict:

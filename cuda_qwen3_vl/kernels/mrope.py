@@ -88,6 +88,9 @@ def apply_mrope(
     cos_3d / sin_3d: (3, B, S, D_rope). mrope_section sums to D_rope // 2.
     """
     cos, sin = _interleave_cos_sin(cos_3d, sin_3d, mrope_section)
+    # Kernel requires cos/sin dtype to match x; cast before dispatch so the CUDA path is usable.
+    cos = cos.to(x.dtype)
+    sin = sin.to(x.dtype)
     if not x.is_cuda:
         return _fallback(x, cos, sin)
     if torch.is_grad_enabled() and x.requires_grad:
