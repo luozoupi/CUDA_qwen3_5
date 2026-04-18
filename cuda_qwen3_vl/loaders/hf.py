@@ -18,6 +18,20 @@ import torch
 from safetensors import safe_open
 
 
+_EXPERT_TRANSPOSE_KEYS = {
+    # HF Qwen3-VL-MoE stores these transposed on dim (1, 2); see HF's
+    # conversion_mapping.py `qwen3_vl_moe` rule. On-disk shapes:
+    #   gate_up_proj: (E, H, 2*I)  -> target (E, 2*I, H)
+    #   down_proj:    (E, I, H)    -> target (E, H, I)
+    "mlp.experts.gate_up_proj",
+    "mlp.experts.down_proj",
+}
+
+
+def _needs_expert_transpose(hf_key: str) -> bool:
+    return any(key in hf_key for key in _EXPERT_TRANSPOSE_KEYS)
+
+
 def _map_name(name: str) -> str | None:
     """Translate HF parameter name to our internal name. Returns None if unmapped."""
     # LM head sits at top-level (not under model.)
@@ -76,6 +90,8 @@ def load_hf_weights(model: torch.nn.Module, snapshot_path: str | Path) -> dict:
                     unexpected.append(key)
                     continue
                 tensor = sf.get_tensor(key)
+                if _needs_expert_transpose(key):
+                    tensor = tensor.transpose(1, 2).contiguous()
                 target = state_dict[mapped]
                 if tensor.shape != target.shape:
                     mismatched.append((key, tuple(tensor.shape), tuple(target.shape)))
