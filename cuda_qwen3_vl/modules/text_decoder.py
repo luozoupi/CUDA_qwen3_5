@@ -48,8 +48,13 @@ class CudaTextDecoderLayer(nn.Module):
             self.mlp = CudaSwiGLUMLP(hidden_size, intermediate_size)
         self.use_moe = use_moe
 
-    def forward(self, x: torch.Tensor, mrope_apply) -> tuple[torch.Tensor, torch.Tensor | None]:
-        attn_out = self.self_attn(self.input_layernorm(x), mrope_apply)
+    def forward(
+        self,
+        x: torch.Tensor,
+        mrope_apply,
+        past_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, tuple[torch.Tensor, torch.Tensor]]:
+        attn_out, new_kv = self.self_attn(self.input_layernorm(x), mrope_apply, past_kv=past_kv)
         x = residual_add(attn_out, x)
         mlp_in = self.post_attention_layernorm(x)
         if self.use_moe:
@@ -57,4 +62,4 @@ class CudaTextDecoderLayer(nn.Module):
         else:
             mlp_out, router_logits = self.mlp(mlp_in), None
         x = residual_add(mlp_out, x)
-        return x, router_logits
+        return x, router_logits, new_kv

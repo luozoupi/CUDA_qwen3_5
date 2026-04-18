@@ -43,7 +43,11 @@ class CudaVisionAttention(nn.Module):
 
 
 class CudaFullAttention(nn.Module):
-    """Qwen3-VL text attention: causal GQA with per-head RMSNorm + MRoPE."""
+    """Qwen3-VL text attention: causal GQA with per-head RMSNorm + MRoPE.
+
+    Supports KV cache: pass `past_kv=(past_k, past_v)` of shape (B, H_kv, S_cache, D)
+    to run an incremental decode step, and get back the updated cache.
+    """
 
     def __init__(
         self,
@@ -72,15 +76,23 @@ class CudaFullAttention(nn.Module):
         self,
         x: torch.Tensor,
         mrope_apply,  # callable (q, k) -> (q_rot, k_rot)
-    ) -> torch.Tensor:
+        past_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         B, S, _ = x.shape
         q = self.q_proj(x).reshape(B, S, self.num_heads, self.head_dim)
         k = self.k_proj(x).reshape(B, S, self.num_kv_heads, self.head_dim)
         v = self.v_proj(x).reshape(B, S, self.num_kv_heads, self.head_dim)
-        q = self.q_norm(q).transpose(1, 2)  # (B, H, S, D)
+        q = self.q_norm(q).transpose(1, 2)
         k = self.k_norm(k).transpose(1, 2)
         v = v.transpose(1, 2)
         q, k = mrope_apply(q, k)
-        out = flash_attention(q, k, v, scale=self.scale, is_causal=True, num_kv_groups=self.num_kv_groups)
+        if past_kv is not None:
+            past_k, past_v = past_kv
+            k = torch.cat([past_k, k], dim=2)
+            v = torch.cat([past_v, v], dim=2)
+        new_kv = (k, v)
+        # Causal only when Q and K have the same length (i.e. prefill with no cache).
+        is_causal = q.shape[2] == k.shape[2]
+        out = flash_attention(q, k, v, scale=self.scale, is_causal=is_causal, num_kv_groups=self.num_kv_groups)
         out = out.transpose(1, 2).reshape(B, S, -1)
-        return self.o_proj(out)
+        return self.o_proj(out), new_kv
