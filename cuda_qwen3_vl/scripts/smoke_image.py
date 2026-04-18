@@ -43,6 +43,8 @@ def main() -> None:
     parser.add_argument("--image", default=None, help="Local image path; if omitted, downloads a sample")
     parser.add_argument("--prompt", default="Describe this image in one sentence.")
     parser.add_argument("--dtype", default="bf16", choices=["bf16", "fp16", "fp32"])
+    parser.add_argument("--use-cuda-vision", action="store_true",
+                        help="Use our CudaVisionTower instead of HF's (vision-tower parity check).")
     args = parser.parse_args()
 
     dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[args.dtype]
@@ -94,14 +96,16 @@ def main() -> None:
         snapshot_path, torch_dtype=dtype, trust_remote_code=True
     ).cuda().eval()
 
-    print(f"[6/7] Extract vision features + deepstack from HF vision tower ...")
+    print(f"[6/7] Extract vision features + deepstack ({'our CudaVisionTower' if args.use_cuda_vision else 'HF vision tower'}) ...")
     with torch.no_grad():
         pixel_values = inputs["pixel_values"].to(hf_model.model.visual.dtype)
-        vision_out = hf_model.model.visual(pixel_values, grid_thw=inputs["image_grid_thw"])
-        # pooler_output is merged + projected to text hidden (64 tokens × 3584 here).
-        # last_hidden_state is pre-merger (256 × 1152). We want the former for scatter.
-        vision_feats = vision_out.pooler_output
-        deepstack_feats = vision_out.deepstack_features
+        grid_thw = inputs["image_grid_thw"]
+        if args.use_cuda_vision:
+            vision_feats, _last, deepstack_feats = our_model.visual(pixel_values.to(dtype), grid_thw)
+        else:
+            vision_out = hf_model.model.visual(pixel_values, grid_thw=grid_thw)
+            vision_feats = vision_out.pooler_output
+            deepstack_feats = vision_out.deepstack_features
         print(f"      vision_feats.shape={tuple(vision_feats.shape)} "
               f"deepstack_n={len(deepstack_feats) if deepstack_feats else 0}")
 

@@ -7,7 +7,7 @@ from .norms import CudaLayerNorm, CudaRMSNorm
 from .rotary import TextMRoPE, Vision2DRoPE
 from .text_decoder import CudaTextDecoderLayer
 from .vision_block import CudaVisionBlock
-from .vision_patch import CudaVisionPatchEmbed, CudaVisionPatchMerger, CudaVisionPositionEmbed
+from .vision_patch import CudaVisionPatchEmbed, CudaVisionPatchMerger
 
 __all__ = [
     "CudaFullAttention",
@@ -25,5 +25,4 @@ __all__ = [
     "CudaVisionBlock",
     "CudaVisionPatchEmbed",
     "CudaVisionPatchMerger",
-    "CudaVisionPositionEmbed",
 ]
